@@ -1,0 +1,39 @@
+name: Design proposal
+description: Propose a change to the architecture, a security control, a baseline choice or a convention
+title: "design: "
+labels: [design, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Discuss the proposal here. Once there's agreement, the maintainer records the decision and a PR implements it.
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: What's the situation or problem? Link the code, workflows or earlier issues involved.
+    validations:
+      required: true
+  - type: textarea
+    id: decision
+    attributes:
+      label: Proposed decision
+      description: What should we do instead, stated as a decision.
+    validations:
+      required: true
+  - type: textarea
+    id: consequences
+    attributes:
+      label: Consequences
+      description: What gets better, what gets worse, and what has to change (cost, security, conventions).
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: input
+    id: supersedes
+    attributes:
+      label: Supersedes or amends
+      description: Earlier decisions or issues this would replace or change, if any.

@@ -1,0 +1,31 @@
+# Rendered by lzctl from the landing zone spec. Edit the spec, not this file.
+#
+# Root module for the FAST 2-networking stage ({{ baseline_tag }}), pinned to commit {{ commit }}.
+# The stage reads datasets/{{ dataset_name }}/, assets/ and fast_version.txt from this directory,
+# so run Terraform here. variables-fast.tf is the stage's own interface: its values are the
+# 0-org-setup outputs, in the tfvars files that stage writes.
+
+terraform {
+  # The provider constraints of Cloud Foundation Fabric {{ baseline_tag }}.
+  required_version = ">= 1.12.2"
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = ">= 8.4.0, < 9.0.0"
+    }
+    google-beta = {
+      source  = "hashicorp/google-beta"
+      version = ">= 8.4.0, < 9.0.0"
+    }
+  }
+}
+
+module "networking" {
+  {{ "source" | ljust(width) }} = "{{ source }}//fast/stages/2-networking?ref={{ commit }}"
+{% for name in variables %}
+  {{ name | ljust(width) }} = var.{{ name }}
+{% endfor %}
+  {{ "factories_config" | ljust(width) }} = {
+    dataset = "datasets/{{ dataset_name }}"
+  }
+}

@@ -1,0 +1,109 @@
+# Tests the skill package: lzctl, golden renders, upstream schemas, the offline Terraform plan and the scanners.
+# Reproduce locally: uv run --with-requirements tests/requirements.txt python -m pytest tests
+name: "CI: Skill"
+run-name: "Skill tests (${{ github.event_name }})"
+
+on:
+  # No path filter on pull requests, so this can become a required status check.
+  pull_request:
+  push:
+    branches: [dev]
+    paths:
+      - .agents/skills/**
+      - .gemini/skills/**
+      - tests/**
+      - evals/**
+      - tools/**
+      - .github/workflows/ci-skill.yml
+
+permissions: {}
+
+concurrency:
+  group: ci-skill-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TERRAFORM_VERSION: 1.16.5
+  CHECKOV_VERSION: 3.3.26
+  CONFTEST_VERSION: 0.71.1
+  # SHA-256 of conftest_0.71.1_Linux_x86_64.tar.gz, from the release asset's digest.
+  CONFTEST_SHA256: c3f6b2a753bd56e377a1e51a95ae3e057f926f2e9139f7d5b5dfbbaf810f7985
+  TFLINT_VERSION: 0.64.0
+  # SHA-256 of tflint_linux_amd64.zip, from the release's checksums.txt.
+  TFLINT_SHA256: cca9d13e2e1d7a2c627af60ff899a3c9b74212899416aeb96ec764d2ef954537
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # Rendered output must not depend on the interpreter.
+        python: ["3.11", "3.13"]
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Set up Trivy
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: v0.75.0
+
+      - name: Install conftest
+        run: |
+          archive="conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz"
+          curl -fsSLo "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/${archive}"
+          echo "${CONFTEST_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum --check --strict
+          mkdir -p "${RUNNER_TEMP}/bin"
+          tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}/bin" conftest
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+
+      - name: Install tflint
+        run: |
+          archive="tflint_linux_amd64.zip"
+          curl -fsSLo "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/terraform-linters/tflint/releases/download/v${TFLINT_VERSION}/${archive}"
+          echo "${TFLINT_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum --check --strict
+          mkdir -p "${RUNNER_TEMP}/bin"
+          unzip -q -o "${RUNNER_TEMP}/${archive}" tflint -d "${RUNNER_TEMP}/bin"
+
+      - name: Install Python dependencies
+        run: python -m pip install -r tests/requirements.txt "checkov==${CHECKOV_VERSION}"
+
+      - name: Check lzctl dependencies
+        run: python .agents/skills/landing-zone/scripts/lzctl doctor --format text
+
+      - name: Run the tests
+        env:
+          # Makes a missing terraform, tflint, trivy, checkov or conftest a failure instead of a skipped test.
+          REQUIRE_TOOLS: "1"
+        run: python -m pytest tests -rs
+
+      - name: Render and check the golden specs
+        run: |
+          lzctl=".agents/skills/landing-zone/scripts/lzctl"
+          for profile in starter standard; do
+            spec="evals/gcp/valid/${profile}.spec.json"
+            out="${RUNNER_TEMP}/render-${profile}"
+            python "${lzctl}" spec validate "${spec}" --format text
+            python "${lzctl}" render "${spec}" --out "${out}" > /dev/null
+            python "${lzctl}" check "${out}" --format text
+          done

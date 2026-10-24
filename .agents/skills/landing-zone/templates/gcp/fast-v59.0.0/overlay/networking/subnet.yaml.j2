@@ -1,0 +1,13 @@
+# Rendered by lzctl from the landing zone spec. Edit the spec, not this file.
+
+# yaml-language-server: $schema=../../../../../schemas/subnet.schema.json
+
+name: {{ name }}
+region: {{ region }}
+ip_cidr_range: {{ cidr }}
+description: Default subnet for {{ vpc }} in {{ region }}
+# Flow logs on every subnet, aggregated and sampled to keep the log volume down.
+flow_logs_config:
+  aggregation_interval: INTERVAL_10_MIN
+  flow_sampling: 0.5
+  metadata: INCLUDE_ALL_METADATA

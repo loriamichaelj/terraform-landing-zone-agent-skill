@@ -1,0 +1,221 @@
+# Reviewed scanner findings on resources the FAST baseline defines. `lzctl check` reports a matching
+# finding as accepted, with its reason, instead of failing; every other finding fails the check.
+#
+# Each entry names one scanner rule in one stage and the resources it covers, by plan address. `*` stands
+# for any part of a key; an address without an instance key covers every instance of that resource. Trivy
+# names resources without their instance key, so its entries cover a whole resource; checkov entries
+# can name single instances.
+#
+# Rules for changing this file: fix a finding in the templates when the templates cause it; accept it here
+# only when the baseline's design requires it or the scanner is wrong, and say which. A spec can never add
+# an entry. tests/test_lzctl_terraform.py fails if an entry no longer matches anything.
+
+# --- 0-org-setup: the stage delegation model -----------------------------------------------------
+
+- scanner: checkov
+  rule: CKV_GCP_115
+  stage: 0-org-setup
+  resources:
+    - module.org_setup.module.organization-iam[0].google_organization_iam_binding.authoritative["roles/owner"]
+  reason: &delegation >-
+    FAST's delegation model: the organization admins group is organization owner, and each stage's
+    read-write service account owns the folders and projects that stage manages (its read-only account
+    views them). These grants are the baseline's design.
+
+- scanner: checkov
+  rule: CKV_GCP_45
+  stage: 0-org-setup
+  resources:
+    - module.org_setup.module.organization-iam[0].google_organization_iam_binding.authoritative["roles/owner"]
+  reason: *delegation
+
+- scanner: checkov
+  rule: CKV_GCP_116
+  stage: 0-org-setup
+  resources:
+    - module.org_setup.module.factory.module.folder-1-iam["*"].google_folder_iam_binding.authoritative["roles/owner"]
+    - module.org_setup.module.factory.module.folder-1-iam["*"].google_folder_iam_binding.authoritative["roles/viewer"]
+  reason: *delegation
+
+- scanner: checkov
+  rule: CKV_GCP_44
+  stage: 0-org-setup
+  resources:
+    - module.org_setup.module.factory.module.folder-1-iam["*"].google_folder_iam_binding.authoritative["roles/owner"]
+  reason: *delegation
+
+- scanner: checkov
+  rule: CKV_GCP_117
+  stage: 0-org-setup
+  resources:
+    - module.org_setup.module.factory.module.projects-iam["*"].google_project_iam_binding.authoritative["roles/owner"]
+    - module.org_setup.module.factory.module.projects-iam["*"].google_project_iam_binding.authoritative["roles/viewer"]
+  reason: *delegation
+
+- scanner: checkov
+  rule: CKV_GCP_49
+  stage: 0-org-setup
+  resources:
+    - module.org_setup.module.factory.module.projects-iam["*"].google_project_iam_binding.authoritative["roles/owner"]
+  reason: *delegation
+
+- scanner: trivy
+  rule: GCP-0007
+  stage: 0-org-setup
+  resources:
+    - module.org_setup.module.organization-iam[0].google_organization_iam_binding.authoritative
+    - module.org_setup.module.organization-iam[0].google_organization_iam_binding.bindings
+    - module.org_setup.module.factory.module.folder-1-iam["*"].google_folder_iam_binding.authoritative
+    - module.org_setup.module.factory.module.folder-1-iam["*"].google_folder_iam_binding.bindings
+    - module.org_setup.module.factory.module.projects-iam["*"].google_project_iam_binding.authoritative
+    - module.org_setup.module.factory.module.buckets["iac-0/*"].google_storage_bucket_iam_binding.authoritative
+  reason: *delegation
+
+# --- 0-org-setup: impersonation in the IaC project --------------------------------------------------
+
+- scanner: checkov
+  rule: CKV_GCP_49
+  stage: 0-org-setup
+  resources:
+    - module.org_setup.module.factory.module.projects-iam["iac-0"].google_project_iam_binding.authoritative["roles/iam.serviceAccountTokenCreator"]
+    - module.org_setup.module.factory.module.projects-iam["iac-0"].google_project_iam_binding.authoritative["roles/iam.serviceAccountAdmin"]
+    - module.org_setup.module.factory.module.projects-iam["iac-0"].google_project_iam_binding.authoritative["roles/cloudbuild.builds.editor"]
+  reason: &impersonation >-
+    The IaC project lets the organization admins group and the CI/CD service accounts impersonate and
+    manage the stage service accounts, which is how FAST runs each stage without service account keys.
+
+- scanner: checkov
+  rule: CKV_GCP_41
+  stage: 0-org-setup
+  resources:
+    - module.org_setup.module.factory.module.projects-iam["iac-0"].google_project_iam_binding.authoritative["roles/iam.serviceAccountTokenCreator"]
+  reason: *impersonation
+
+- scanner: trivy
+  rule: GCP-0011
+  stage: 0-org-setup
+  resources:
+    - module.org_setup.module.factory.module.projects-iam["iac-0"].google_project_iam_binding.authoritative
+  reason: *impersonation
+
+# --- Google-managed service agents ---------------------------------------------------------------------
+
+- scanner: checkov
+  rule: CKV_GCP_49
+  stage: 0-org-setup
+  resources:
+    - module.org_setup.module.factory.module.projects["*"].google_project_iam_member.service_agents
+  reason: &service-agents >-
+    Grants to Google-managed service agents, which the enabled APIs need in order to work. Google
+    manages these identities; no person or workload of yours can use them.
+
+- scanner: checkov
+  rule: CKV_GCP_49
+  stage: 2-networking
+  resources:
+    - module.networking.module.projects.module.projects["*"].google_project_iam_member.service_agents
+  reason: *service-agents
+
+# --- Audit logging ---------------------------------------------------------------------------------------
+
+- scanner: checkov
+  rule: CKV2_GCP_5
+  stage: 0-org-setup
+  resources:
+    - module.org_setup.module.factory.module.projects["*"].google_project.project
+  reason: &audit >-
+    Admin Activity audit logs are always on and the organization sink exports them to the log project.
+    FAST leaves Data Access logs off (except for STS) because of their volume and cost; turn them on per
+    service if your compliance requires it.
+
+- scanner: checkov
+  rule: CKV2_GCP_5
+  stage: 2-networking
+  resources:
+    - module.networking.module.projects.module.projects["*"].google_project.project
+  reason: *audit
+
+- scanner: trivy
+  rule: GCP-0079
+  stage: 0-org-setup
+  resources:
+    - module.org_setup.module.factory.module.projects["*"].google_project.project
+    - module.org_setup.module.factory.module.projects-iam["iac-0"].google_project_iam_audit_config.default
+  reason: *audit
+
+- scanner: trivy
+  rule: GCP-0079
+  stage: 2-networking
+  resources:
+    - module.networking.module.projects.module.projects["*"].google_project.project
+  reason: *audit
+
+# --- The Terraform state and output buckets ------------------------------------------------------------
+
+- scanner: checkov
+  rule: CKV_GCP_62
+  stage: 0-org-setup
+  resources:
+    - module.org_setup.module.factory.module.buckets["iac-0/*"].google_storage_bucket.bucket
+  reason: &bucket-logs >-
+    The state and output buckets rely on Cloud Audit Logs: Admin Activity logs record their configuration
+    and IAM changes. FAST configures no object-level access logs for them.
+
+- scanner: checkov
+  rule: CKV_GCP_63
+  stage: 0-org-setup
+  resources:
+    - module.org_setup.module.factory.module.buckets["iac-0/*"].google_storage_bucket.bucket
+  reason: *bucket-logs
+
+- scanner: trivy
+  rule: GCP-0077
+  stage: 0-org-setup
+  resources:
+    - module.org_setup.module.factory.module.buckets["iac-0/*"].google_storage_bucket.bucket
+  reason: *bucket-logs
+
+- scanner: checkov
+  rule: CKV_GCP_114
+  stage: 0-org-setup
+  resources:
+    - module.org_setup.module.factory.module.buckets["iac-0/*"].google_storage_bucket.bucket
+  reason: >-
+    Public access prevention is enforced for the whole organization by the storage.publicAccessPrevention
+    org policy, which the policy pack requires; the bucket setting would repeat it.
+
+- scanner: trivy
+  rule: GCP-0066
+  stage: 0-org-setup
+  resources:
+    - module.org_setup.module.factory.module.buckets["iac-0/*"].google_storage_bucket.bucket
+  reason: &cmek >-
+    Google-managed encryption keys. Customer-managed keys belong to the regulated profile
+    (security.customer_managed_keys), which is not rendered yet.
+
+- scanner: checkov
+  rule: CKV_GCP_81
+  stage: 0-org-setup
+  resources:
+    - module.org_setup.module.factory.module.bigquery-datasets["billing-0/billing_export"].google_bigquery_dataset.default
+  reason: *cmek
+
+# --- 2-networking: scanner false positives --------------------------------------------------------------
+
+- scanner: trivy
+  rule: GCP-0074
+  stage: 2-networking
+  resources:
+    - module.networking.module.vpc-factory.module.firewall["*"].google_compute_firewall.custom_rules
+  reason: >-
+    False positive: each VPC's only firewall rule is the deny-all ingress rule at the lowest priority, so the
+    full port range is denied, not allowed.
+
+- scanner: checkov
+  rule: CKV2_GCP_18
+  stage: 2-networking
+  resources:
+    - module.networking.module.vpc-factory.module.vpcs["*"].google_compute_network.network
+  reason: >-
+    False positive: every VPC gets its own firewall rules and the hierarchical firewall policy. The scanner
+    cannot link a rule to a network whose ID is known only after apply.

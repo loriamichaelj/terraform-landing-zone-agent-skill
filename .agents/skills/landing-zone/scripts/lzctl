@@ -1,0 +1,1388 @@
+#!/usr/bin/env python3
+"""lzctl: deterministic landing zone tooling shared by every agent host.
+
+Commands:
+  spec validate <spec.json>          Check a spec against the core and per-cloud schemas.
+  render <spec.json> --out <dir>     Render a valid spec into FAST datasets and a root module per stage (GCP).
+  check <dir> [--offline]            Verify a rendered directory: integrity, schemas, policies, Terraform plan, scans.
+  explain [dir] [--findings <file>]  Map findings back to the spec fields that caused them.
+  doctor                             Check runtime dependencies.
+
+Exit codes: 0 clean, 1 findings or render refused, 2 usage or environment error.
+Requires Python 3.11+, jsonschema, jinja2 and PyYAML.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from importlib import metadata
+from pathlib import Path
+
+SKILL_DIR = Path(__file__).resolve().parent.parent
+SCHEMA_DIR = SKILL_DIR / "schemas"
+TEMPLATE_DIR = SKILL_DIR / "templates"
+
+EXIT_OK, EXIT_FINDINGS, EXIT_ERROR = 0, 1, 2
+
+# One pinned baseline per cloud per skill version. Bumping requires re-vendoring
+# (tools/vendor_fast.py), updating the overlays and a full eval run.
+BASELINES = {
+    "gcp": {
+        "tag": "v59.0.0",
+        "dir": "gcp/fast-v59.0.0",
+        "dataset": "classic",
+        "networking_dataset": "hub-and-spokes-peerings",
+        "output_dataset": "landing-zone",
+    },
+}
+
+# Rendered networking files live under this directory, next to the 0-org-setup output.
+NETWORKING_ROOT = "2-networking/"
+
+# Each FAST stage is a Terraform root module in the output: a rendered main.tf that calls the stage at the
+# pinned commit, beside the stage's vendored working-directory files (upstream/stages/<stage>/).
+# {stage: (directory in the output, main.tf template)}
+STAGES = {"0-org-setup": ("", "main.tf.j2"), "2-networking": (NETWORKING_ROOT, "networking/main.tf.j2")}
+VARIABLE_BLOCK = re.compile(r'^variable "(\w+)"', re.MULTILINE)
+
+# CIDR plan: the supernet splits into four fixed slots, each slot into 16 blocks.
+# Fixed positions mean selecting or adding an environment or region never renumbers the others.
+NETWORK_SLOTS = {"hub": 0, "dev": 1, "stage": 2, "prod": 3}
+MAX_REGIONS = 8  # blocks 0 to 7 of a slot; block 15 is the private service access range
+PSA_BLOCK = 15
+
+# Upstream networking demo content the render drops or replaces, so no placeholder reaches a landing zone
+# (a fake VPN with a shared secret, a placeholder interconnect, DNS forwarders, example zones).
+NETWORKING_DROPPED = (
+    "README.md",
+    "defaults.yaml",
+    "dns/zones/net-core-0/fwd-root.yaml",
+    "dns/zones/net-core-0/pvt-test.yaml",
+    "dns/zones/net-dev-0/",
+    "dns/zones/net-prod-0/",
+    "projects/net-dev-0.yaml",
+    "projects/net-prod-0.yaml",
+    "vpcs/dev/",
+    "vpcs/prod/",
+    "vpcs/hub/.config.yaml",
+    "vpcs/hub/subnets/",
+    "vpcs/hub/vlan-attachments/",
+    "vpcs/hub/vpns/",
+)
+# Upstream files kept, with the environment list inside them replaced.
+PEER_ROOT_CLIENTS = "  client_networks:\n    - $networks:dev\n    - $networks:prod\n"
+RESPONSE_POLICY_NETWORKS = "networks:\n  - $networks:dev\n  - $networks:hub\n  - $networks:prod\n"
+
+# Canonical order, so output never depends on the order in the spec.
+ENVIRONMENTS = {
+    "dev": {"tag_value": "development", "folder_name": "Development", "description": "Development."},
+    "stage": {"tag_value": "staging", "folder_name": "Staging", "description": "Staging."},
+    "prod": {"tag_value": "production", "folder_name": "Production", "description": "Production."},
+}
+
+# Spec fields the GCP renderer does not turn into configuration yet, with the stage that will.
+# The network fields are rendered when networking_support() says so, and listed here only when it does not.
+NETWORK_FIELDS = ("network.topology", "network.cidr_supernet", "network.private_service_access", "extensions.gcp.hub_connectivity")
+DEFERRED_GCP = {
+    "iam.groups.network_admins": "2-networking IAM",
+    "iam.groups.security_admins": "2-security dataset",
+    "security.service_perimeter": "1-vpcsc and the hardened dataset (regulated profile)",
+    "security.customer_managed_keys": "2-security and the hardened dataset (regulated profile)",
+    "security.compliance": "policy pack",
+    "extensions.gcp.audit_sink": "additional log sinks",
+}
+
+REPORT_NAME = "render-report.json"
+VALIDATION_REPORT = "validation-report.md"  # written by `check --write-report`; not part of the render
+SCHEMA_DECLARATION = re.compile(rb"yaml-language-server: \$schema=\S*?([\w-]+\.schema\.json)")
+
+# Policy pack: conftest runs the rules in policies/<cloud>/ over the rendered YAML.
+POLICY_DIR = SKILL_DIR / "policies"
+POLICY_TARGETS = ("datasets", "2-networking/datasets")
+
+# Terraform runs on a private copy of each stage root, never in the rendered directory. The plan is offline:
+# no refresh and a placeholder token, so it needs no credentials and nothing reaches a cloud API.
+TERRAFORM_TIMEOUT = 600
+TERRAFORM_FILE = re.compile(r"(\.tf|\.tf\.json|\.tofu|\.tfvars|\.tfvars\.json|\.terraformrc|terraform\.rc)$")
+OFFLINE_PROVIDERS = ("lzctl-offline-providers.tf", """provider "google" {
+  access_token = "lzctl-offline-plan"
+}
+
+provider "google-beta" {
+  access_token = "lzctl-offline-plan"
+}
+""")
+TERRAFORM_WORKING = {".terraform.lock.hcl", "terraform.tfstate", "terraform.tfstate.backup"}  # plus .terraform/ and *.tfplan
+OFFLINE_INPUTS = "lzctl-offline.auto.tfvars.json"  # placeholder 0-org-setup outputs for later stages
+PLAN_FILE = "lzctl.tfplan"
+TFLINT_CONFIG = "tflint.hcl"  # in policies/<cloud>/
+ACCEPTED_FINDINGS = "accepted-findings.yaml"  # in policies/<cloud>/: reviewed scanner findings on the baseline
+
+# Misconfiguration scanners. They scan each stage's plan, so they see the resources the stage would create.
+SCAN_TIMEOUT = 120
+SUPPRESSION = re.compile(rb"checkov:skip|trivy:ignore|tfsec:ignore", re.IGNORECASE)
+
+TOOLS = {
+    "terraform": "fmt, validate and the offline plan (OpenTofu also works)",
+    "tflint": "lint",
+    "trivy": "misconfiguration scan",
+    "checkov": "misconfiguration scan",
+    "conftest": "policy checks",
+}
+
+
+class RenderError(Exception):
+    """The spec cannot be rendered; the message says why."""
+
+
+class CheckError(Exception):
+    """The directory cannot be checked at all; the message says why."""
+
+
+def _fail(message: str) -> int:
+    print(f"lzctl: {message}", file=sys.stderr)
+    return EXIT_ERROR
+
+
+def _load_json(path: Path) -> object:
+    with path.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _dotted(path) -> str:
+    return ".".join(str(part) for part in path) or "(root)"
+
+
+def _finding(rule: str, path: str, message: str) -> dict:
+    return {"rule": rule, "path": path, "message": message}
+
+
+def _schema_findings(validator_cls, schema: dict, instance: object) -> list[dict]:
+    findings = []
+    for error in validator_cls(schema).iter_errors(instance):
+        path = _dotted(error.absolute_path)
+        if error.validator == "not" and path.endswith("extensions"):
+            message = "extensions may only contain the block for target.cloud"
+        elif error.validator == "required":
+            message = error.message
+        else:
+            message = error.message if len(error.message) <= 160 else error.message[:157] + "..."
+        findings.append(_finding(f"schema.{error.validator}", path, message))
+    return findings
+
+
+def _strings(node: object, path: tuple = ()):
+    if isinstance(node, str):
+        yield path, node
+    elif isinstance(node, dict):
+        for key, value in node.items():
+            yield from _strings(value, path + (key,))
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            yield from _strings(value, path + (index,))
+
+
+def _semantic_findings(spec: dict) -> list[dict]:
+    """Checks JSON Schema can't express."""
+    findings = []
+    # Python's `$` also matches before a trailing newline, unlike ECMA-262; values reach templates.
+    for path, value in _strings(spec):
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+            findings.append(_finding("semantic.control_character", _dotted(path), "control characters are not allowed"))
+    regions = spec.get("network", {}).get("regions")
+    if isinstance(regions, list) and len(regions) > MAX_REGIONS:
+        findings.append(_finding("semantic.regions", "network.regions", f"at most {MAX_REGIONS} regions are supported"))
+    cidr = spec.get("network", {}).get("cidr_supernet")
+    if isinstance(cidr, str):
+        try:
+            net = ipaddress.ip_network(cidr, strict=True)
+        except ValueError as exc:
+            findings.append(_finding("semantic.cidr", "network.cidr_supernet", str(exc)))
+        else:
+            if net.version != 4 or not net.is_private:
+                findings.append(_finding("semantic.cidr", "network.cidr_supernet", f"{cidr} is not a private IPv4 range"))
+            elif net.prefixlen > 16:
+                findings.append(_finding("semantic.cidr", "network.cidr_supernet", f"{cidr} is too small for a supernet; use /16 or larger"))
+    return findings
+
+
+def validate_spec(spec: object) -> list[dict]:
+    try:
+        from jsonschema import Draft202012Validator
+    except ImportError as exc:
+        raise RuntimeError("jsonschema is not installed; run `lzctl doctor`") from exc
+
+    core = _load_json(SCHEMA_DIR / "lz-spec.core.schema.json")
+    findings = _schema_findings(Draft202012Validator, core, spec)
+    if not isinstance(spec, dict):
+        return findings
+
+    findings += _semantic_findings(spec)
+
+    target = spec.get("target")
+    cloud = target.get("cloud") if isinstance(target, dict) else None
+    if isinstance(cloud, str):
+        schema_path = SCHEMA_DIR / f"lz-spec.{cloud}.schema.json"
+        if schema_path.exists():
+            findings += _schema_findings(Draft202012Validator, _load_json(schema_path), spec)
+        else:
+            findings.append(_finding("semantic.cloud_unsupported", "target.cloud", f"{cloud} is not supported yet"))
+
+    return sorted(findings, key=lambda f: (f["path"], f["rule"], f["message"]))
+
+
+# --- render -----------------------------------------------------------------
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _output_hash(digests: dict[str, str]) -> str:
+    return _sha256("".join(f"{path}\0{digest}\n" for path, digest in sorted(digests.items())).encode("utf-8"))
+
+
+def _present(spec: dict, dotted: str) -> bool:
+    node: object = spec
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return False
+        node = node[part]
+    return True
+
+
+def _load_baseline(cloud: str) -> tuple[dict, Path]:
+    baseline = BASELINES.get(cloud)
+    if baseline is None:
+        raise RenderError(f"{cloud} has no baseline yet")
+    root = TEMPLATE_DIR / baseline["dir"]
+    manifest = _load_json(root / "MANIFEST.json")
+    for relative, expected in manifest["files"].items():
+        path = root / "upstream" / relative
+        if not path.is_file() or _sha256(path.read_bytes()) != expected:
+            raise RenderError(f"vendored upstream file {relative} does not match MANIFEST.json; re-run tools/vendor_fast.py")
+    return manifest, root
+
+
+def plan_cidrs(supernet: str, regions: list[str], environments: list[str], psa: bool) -> dict:
+    """Deterministic CIDR plan: {vpc: {"subnets": {region: cidr}, "psa": cidr or None}}.
+
+    Slots are fixed by name (hub, dev, stage, prod); within a slot, region i gets block i (its default
+    /24 is the block's first /24) and block 15 holds the private service access range (at most a /20).
+    """
+    slots = list(ipaddress.ip_network(supernet, strict=True).subnets(prefixlen_diff=2))
+    plan = {}
+    for name in ["hub", *[env for env in ENVIRONMENTS if env in environments]]:
+        blocks = list(slots[NETWORK_SLOTS[name]].subnets(prefixlen_diff=4))
+        psa_range = None
+        if psa and name != "hub":
+            psa_range = str(next(blocks[PSA_BLOCK].subnets(new_prefix=max(blocks[PSA_BLOCK].prefixlen, 20))))
+        plan[name] = {
+            "subnets": {region: str(next(blocks[i].subnets(new_prefix=24))) for i, region in enumerate(regions)},
+            "psa": psa_range,
+        }
+    return plan
+
+
+def networking_support(spec: dict) -> str | None:
+    """None when the networking stage can be rendered, otherwise why not."""
+    if spec["network"]["topology"] != "hub_spoke":
+        return "the single topology has no upstream dataset"
+    connectivity = spec["extensions"]["gcp"].get("hub_connectivity", "peering")
+    if connectivity != "peering":
+        return f"hub_connectivity {connectivity} needs the hub-and-spokes-{connectivity} dataset, which is not vendored"
+    return None
+
+
+def _template_env(root: Path):
+    try:
+        import jinja2
+    except ImportError as exc:
+        raise RuntimeError("jinja2 is not installed; run `lzctl doctor`") from exc
+    env = jinja2.Environment(
+        loader=jinja2.FileSystemLoader(str(root / "overlay")),
+        undefined=jinja2.StrictUndefined,
+        trim_blocks=True,
+        lstrip_blocks=True,
+        keep_trailing_newline=True,
+        autoescape=False,
+    )
+    env.filters["md"] = _md
+    env.filters["code"] = _md_code
+    env.filters["ljust"] = lambda value, width: str(value).ljust(width)
+
+    def render(template: str, **values) -> bytes:
+        return env.get_template(template).render(**values).encode("utf-8")
+
+    return render
+
+
+def _stage_root(stage: str, root: Path, manifest: dict, baseline: dict, render) -> dict[str, bytes]:
+    """A stage's root module, keyed by path inside it: the vendored stage files and a main.tf that calls the
+    stage at the pinned commit. The same for every spec, so `check` can rebuild it to compare."""
+    base = root / "upstream" / "stages" / stage
+    files = {p.relative_to(base).as_posix(): p.read_bytes() for p in sorted(base.rglob("*")) if p.is_file()}
+    variables = VARIABLE_BLOCK.findall(files.get("variables-fast.tf", b"").decode("utf-8"))
+    files["main.tf"] = render(
+        STAGES[stage][1], baseline_tag=manifest["tag"], commit=manifest["commit"], source=f"git::{manifest['source']}.git",
+        dataset_name=baseline["output_dataset"], variables=variables,
+        width=max(len(name) for name in [*variables, "factories_config"]),
+    )
+    return files
+
+
+def _render_networking(spec: dict, root: Path, manifest: dict, render, baseline: dict) -> tuple[dict[str, bytes], dict[str, list[str]]]:
+    """The 2-networking dataset: upstream hub-and-spokes-peerings with the spec-driven files replaced."""
+    upstream = root / "upstream" / "networking" / "datasets" / manifest["networking_dataset"]
+    files = {p.relative_to(upstream).as_posix(): p.read_bytes() for p in sorted(upstream.rglob("*")) if p.is_file()}
+    for dropped in NETWORKING_DROPPED:
+        matched = [path for path in files if path == dropped or (dropped.endswith("/") and path.startswith(dropped))]
+        if not matched:
+            raise RenderError(f"upstream networking file {dropped} is gone; update NETWORKING_DROPPED for the new baseline")
+        for path in matched:
+            del files[path]
+
+    environments = [env for env in ENVIRONMENTS if env in spec["hierarchy"]["environments"]]
+    regions = spec["network"]["regions"]
+    plan = plan_cidrs(spec["network"]["cidr_supernet"], regions, environments, bool(spec["network"].get("private_service_access")))
+    sources: dict[str, list[str]] = {}
+
+    def add(path: str, data: bytes, *fields: str) -> None:
+        files[path] = data
+        sources[path] = sorted(fields)
+
+    def subnet_files(vpc: str) -> None:
+        for index, region in enumerate(regions):
+            name = f"{vpc}-default" if index == 0 else f"{vpc}-default-{region}"
+            region_ref = "$locations:primary" if index == 0 else region
+            add(f"vpcs/{vpc}/subnets/{name}.yaml",
+                render("networking/subnet.yaml.j2", name=name, region=region_ref, cidr=plan[vpc]["subnets"][region], vpc=vpc),
+                "network.cidr_supernet", "network.regions")
+
+    add("defaults.yaml", render("networking/defaults.yaml.j2", regions=regions), "network.regions")
+    add("vpcs/hub/.config.yaml", render("networking/vpc-hub.yaml.j2", regions=regions, environments=environments),
+        "hierarchy.environments", "network.regions")
+    subnet_files("hub")
+    for env in environments:
+        add(f"projects/net-{env}-0.yaml", render("networking/project.yaml.j2", env=env), "hierarchy.environments")
+        add(f"vpcs/{env}/.config.yaml",
+            render("networking/vpc-spoke.yaml.j2", env=env, regions=regions, psa_range=plan[env]["psa"]),
+            "network.cidr_supernet", "network.private_service_access", "network.regions")
+        add(f"vpcs/{env}/firewall-rules/default-ingress.yaml", render("networking/firewall-rules-spoke.yaml.j2", env=env),
+            "hierarchy.environments")
+        subnet_files(env)
+
+    networks = "".join(f"    - $networks:{env}\n" for env in environments)
+    peer_root = files["dns/zones/net-core-0/peer-root.yaml"].decode("utf-8")
+    policy = files["dns/response-policies/net-core-0.yaml"].decode("utf-8")
+    if PEER_ROOT_CLIENTS not in peer_root or RESPONSE_POLICY_NETWORKS not in policy:
+        raise RenderError("upstream DNS files changed shape; update the networking patches for the new baseline")
+    add("dns/zones/net-core-0/peer-root.yaml",
+        peer_root.replace(PEER_ROOT_CLIENTS, "  client_networks:\n" + networks).encode("utf-8"), "hierarchy.environments")
+    add("dns/response-policies/net-core-0.yaml",
+        policy.replace(RESPONSE_POLICY_NETWORKS, "networks:\n  - $networks:hub\n" + networks.replace("    -", "  -")).encode("utf-8"),
+        "hierarchy.environments")
+
+    output = {NETWORKING_ROOT + f"datasets/{baseline['output_dataset']}/{path}": data for path, data in files.items()}
+    sources = {NETWORKING_ROOT + f"datasets/{baseline['output_dataset']}/{path}": fields for path, fields in sources.items()}
+    output.update({NETWORKING_ROOT + path: data for path, data in _stage_root("2-networking", root, manifest, baseline, render).items()})
+    sources[NETWORKING_ROOT + "main.tf"] = ["target.baseline_version"]
+    return output, sources
+
+
+def _md(value: object) -> str:
+    """Make a spec value safe for a markdown table cell: no table breaks, no HTML, no emphasis or code."""
+    text = value if isinstance(value, str) else json.dumps(value, sort_keys=True, ensure_ascii=False)
+    for char in ("\\", "|", "`", "*", "_", "[", "]", "<", ">", "&"):
+        text = text.replace(char, "&" + {"&": "amp", "<": "lt", ">": "gt"}[char] + ";" if char in "&<>" else "\\" + char)
+    return text
+
+
+def _md_code(value: object) -> str:
+    """Make a spec value safe inside a markdown code span in a table cell."""
+    text = value if isinstance(value, str) else json.dumps(value, sort_keys=True, ensure_ascii=False)
+    return text.replace("`", "'").replace("|", "\\|")
+
+
+def render_spec(spec: dict) -> tuple[dict[str, bytes], dict]:
+    """Return ({relative path: bytes}, report). Pure: same spec and skill version, same bytes."""
+    findings = validate_spec(spec)
+    if findings:
+        raise RenderError(f"spec is invalid ({len(findings)} findings); run `lzctl spec validate`")
+
+    cloud = spec["target"]["cloud"]
+    if spec["target"]["profile"] == "regulated":
+        raise RenderError("the regulated profile needs the FAST hardened dataset, which is not supported yet")
+
+    baseline = BASELINES[cloud]
+    manifest, root = _load_baseline(cloud)
+    if spec["target"]["baseline_version"] != manifest["tag"]:
+        raise RenderError(f"baseline_version {spec['target']['baseline_version']} does not match the vendored {manifest['tag']}")
+
+    render = _template_env(root)
+
+    dataset_prefix = f"datasets/{baseline['output_dataset']}/"
+    upstream_dataset = root / "upstream" / "datasets" / baseline["dataset"]
+    files: dict[str, bytes] = {}
+    for path in sorted(upstream_dataset.rglob("*")):
+        if path.is_file():
+            files[path.relative_to(upstream_dataset).as_posix()] = path.read_bytes()
+
+    selected = [name for name in ENVIRONMENTS if name in spec["hierarchy"]["environments"]]
+    envs = [ENVIRONMENTS[name] for name in selected]
+
+    # Which spec fields drive each generated file; `lzctl explain` reads this back.
+    sources: dict[str, list[str]] = {}
+
+    def driven_by(path: str, *fields: str) -> None:
+        sources[dataset_prefix + path] = sorted(fields)
+
+    # Environment folders: drop the dataset's own, then render the selected ones.
+    for path in [p for p in files if p.startswith(("folders/networking/", "folders/security/")) and p.count("/") == 3]:
+        del files[path]
+    for name in selected:
+        for kind in ("networking", "security"):
+            files[f"folders/{kind}/{name}/.config.yaml"] = render(f"folder-{kind}-env.yaml.j2", env=ENVIRONMENTS[name])
+            driven_by(f"folders/{kind}/{name}/.config.yaml", "hierarchy.environments")
+
+    for unit in sorted(spec["hierarchy"].get("business_units", [])):
+        files[f"folders/teams/{unit}/.config.yaml"] = render("folder-team.yaml.j2", name=unit)
+        driven_by(f"folders/teams/{unit}/.config.yaml", "hierarchy.business_units")
+
+    logging = spec["logging"]
+    ext = spec["extensions"]["gcp"]
+    files["organization/tags/environment.yaml"] = render("tags-environment.yaml.j2", environments=envs)
+    files["projects/core/log-0.yaml"] = render(
+        "log-0.yaml.j2",
+        retention_days=logging["retention_days"],
+        log_analytics=logging["audit_destination"] in ("analytics", "both"),
+    )
+    files["defaults.yaml"] = render(
+        "defaults.yaml.j2",
+        billing_account=spec["organization"]["billing_ref"],
+        domain=spec["organization"]["domain"],
+        organization_id=int(spec["organization"]["id"]),
+        customer_id=ext["customer_id"],
+        prefix=ext["prefix"],
+        org_admins=spec["iam"]["groups"]["org_admins"],
+        primary_region=spec["network"]["regions"][0],
+    )
+
+    driven_by("organization/tags/environment.yaml", "hierarchy.environments")
+    driven_by("projects/core/log-0.yaml", "logging.audit_destination", "logging.retention_days")
+    driven_by("defaults.yaml", "extensions.gcp.customer_id", "extensions.gcp.prefix", "iam.groups.org_admins",
+              "network.regions", "organization.billing_ref", "organization.domain", "organization.id")
+    sources["main.tf"] = ["target.baseline_version"]
+
+    output = {dataset_prefix + path: data for path, data in files.items()}
+    output.update(_stage_root("0-org-setup", root, manifest, baseline, render))
+    not_networking = networking_support(spec)
+    if not_networking is None:
+        net_files, net_sources = _render_networking(spec, root, manifest, render, baseline)
+        output.update(net_files)
+        sources.update(net_sources)
+
+    deferred = {field: stage for field, stage in DEFERRED_GCP.items() if _present(spec, field)}
+    if not_networking is not None:
+        for field in NETWORK_FIELDS:
+            if _present(spec, field):
+                deferred[field] = not_networking
+        if spec["network"]["regions"][1:]:
+            deferred["network.regions[1:]"] = not_networking
+
+    # The README and the decision log are rendered files like any other: hashed, and protected by `check`.
+    output["README.md"] = render(
+        "README.md.j2",
+        domain=spec["organization"]["domain"],
+        organization_id=spec["organization"]["id"],
+        profile=spec["target"]["profile"],
+        environments=selected,
+        topology=spec["network"]["topology"],
+        regions=spec["network"]["regions"],
+        baseline_tag=manifest["tag"],
+        baseline_commit=manifest["commit"][:12],
+        not_rendered=sorted(deferred.items()),
+        has_networking=not_networking is None,
+    )
+    output["decision-log.md"] = render("decision-log.md.j2", decisions=spec.get("decisions", []))
+    sources["README.md"] = sorted({"hierarchy.environments", "network.regions", "network.topology", "organization.domain",
+                                   "organization.id", "target.baseline_version", "target.profile", *deferred})
+    sources["decision-log.md"] = ["decisions"]
+
+    digests = {path: _sha256(data) for path, data in sorted(output.items())}
+    output_hash = _output_hash(digests)
+    report = {
+        "baseline": {"cloud": cloud, "tag": manifest["tag"], "commit": manifest["commit"], "dataset": baseline["dataset"]},
+        "output_hash": output_hash,
+        "files": digests,
+        "not_rendered_yet": dict(sorted(deferred.items())),
+        "sources": dict(sorted(sources.items())),
+    }
+    return output, report
+
+
+def cmd_render(args: argparse.Namespace) -> int:
+    path = Path(args.spec)
+    try:
+        spec = _load_json(path)
+    except FileNotFoundError:
+        return _fail(f"{path} not found")
+    except json.JSONDecodeError as exc:
+        return _fail(f"{path} is not valid JSON: {exc}")
+    if not isinstance(spec, dict):
+        return _fail(f"{path} must contain a JSON object")
+
+    out = Path(args.out)
+    if out.exists() and any(out.iterdir()):
+        return _fail(f"{out} exists and is not empty")
+
+    try:
+        files, report = render_spec(spec)
+    except RenderError as exc:
+        print(json.dumps({"rendered": False, "reason": str(exc)}, indent=2))
+        return EXIT_FINDINGS
+    except RuntimeError as exc:
+        return _fail(str(exc))
+
+    for relative, data in files.items():
+        target = out / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    (out / "render-report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(json.dumps({"rendered": True, "out": str(out), "files": len(files), "output_hash": report["output_hash"],
+                      "not_rendered_yet": report["not_rendered_yet"]}, indent=2, sort_keys=True))
+    return EXIT_OK
+
+
+# --- check ------------------------------------------------------------------
+
+
+def _check_result(name: str, status: str, detail: str = "") -> dict:
+    return {"name": name, "status": status, "detail": detail}
+
+
+def _walk_files(directory: Path) -> tuple[dict[str, Path], list[str]]:
+    """Regular files by relative path, and symlinks (never followed). Terraform's working files in a stage
+    root are not configuration and are skipped: a stage root is where Terraform runs."""
+    files: dict[str, Path] = {}
+    links: list[str] = []
+    stage_dirs = {prefix.rstrip("/") or "." for prefix, _ in STAGES.values()}
+    for root, dirs, names in os.walk(directory, followlinks=False):
+        in_stage_root = os.path.relpath(root, directory) in stage_dirs
+        if in_stage_root:
+            dirs[:] = [d for d in dirs if d != ".terraform"]
+        for name in sorted(dirs + names):
+            path = Path(root) / name
+            if in_stage_root and (name in TERRAFORM_WORKING or name.endswith(".tfplan")):
+                continue
+            if path.is_symlink():
+                links.append(path.relative_to(directory).as_posix())
+            elif path.is_file():
+                files[path.relative_to(directory).as_posix()] = path
+    return files, sorted(links)
+
+
+def _load_report(directory: Path) -> dict:
+    path = directory / REPORT_NAME
+    if not path.is_file():
+        raise CheckError(f"{directory} has no {REPORT_NAME}; render into it first")
+    try:
+        report = _load_json(path)
+    except json.JSONDecodeError as exc:
+        raise CheckError(f"{path} is not valid JSON: {exc}") from exc
+    files = report.get("files") if isinstance(report, dict) else None
+    baseline = report.get("baseline") if isinstance(report, dict) else None
+    if (
+        not isinstance(files, dict)
+        or not all(isinstance(k, str) and isinstance(v, str) for k, v in files.items())
+        or not isinstance(report.get("output_hash"), str)
+        or not isinstance(baseline, dict)
+        or not isinstance(baseline.get("cloud"), str)
+    ):
+        raise CheckError(f"{path} is not a render report")
+    return report
+
+
+def _integrity_findings(report: dict, on_disk: dict[str, Path], links: list[str]) -> list[dict]:
+    findings = [_finding("check.integrity.symlink", link, "symbolic links are not allowed in rendered output") for link in links]
+    expected = report["files"]
+    for relative in sorted(set(expected) - set(on_disk)):
+        findings.append(_finding("check.integrity.missing", relative, "listed in the render report but not on disk"))
+    for relative in sorted(set(on_disk) - set(expected) - {REPORT_NAME, VALIDATION_REPORT}):
+        findings.append(_finding("check.integrity.extra", relative, "on disk but not in the render report; only `lzctl render` may create files"))
+    for relative in sorted(set(expected) & set(on_disk)):
+        if _sha256(on_disk[relative].read_bytes()) != expected[relative]:
+            findings.append(_finding("check.integrity.modified", relative, "differs from the render report; edit the spec and re-render instead"))
+    if _output_hash(expected) != report["output_hash"]:
+        findings.append(_finding("check.integrity.output_hash", REPORT_NAME, "output_hash does not match the listed file digests"))
+    return findings
+
+
+def _schema_check(report: dict, on_disk: dict[str, Path]) -> tuple[list[dict], int, int]:
+    """Validate YAML against the vendored upstream schemas. Returns (findings, validated, undeclared)."""
+    try:
+        import yaml
+        from jsonschema import validators
+    except ImportError as exc:
+        raise CheckError("jsonschema or PyYAML is not installed; run `lzctl doctor`") from exc
+
+    cloud = report["baseline"]["cloud"]
+    try:
+        manifest, root = _load_baseline(cloud)
+    except RenderError as exc:
+        raise CheckError(str(exc)) from exc
+    findings = []
+    if report["baseline"].get("tag") != manifest["tag"]:
+        findings.append(_finding("check.baseline.mismatch", REPORT_NAME,
+                                 f"rendered with {report['baseline'].get('tag')}, but this skill vendors {manifest['tag']}"))
+
+    # Each stage has its own schemas, and some names (project, defaults) differ between stages.
+    schema_dirs = {True: root / "upstream" / "networking" / "schemas", False: root / "upstream" / "schemas"}
+    cache: dict[tuple[bool, str], object] = {}
+    validated = undeclared = 0
+    for relative, path in sorted(on_disk.items()):
+        if not relative.endswith((".yaml", ".yml")):
+            continue
+        if any(relative.startswith(prefix + "assets/") for prefix, _ in STAGES.values()):
+            continue  # stage assets are Terraform templates, not YAML
+        data = path.read_bytes()
+        try:
+            # Some upstream files hold only comments; an empty factory file means an empty map.
+            document = yaml.safe_load(data) or {}
+        except yaml.YAMLError as exc:
+            findings.append(_finding("check.yaml.parse", relative, str(exc).replace("\n", " ")[:160]))
+            continue
+        declared = SCHEMA_DECLARATION.search(data)
+        if declared is None:
+            undeclared += 1
+            continue
+        name = declared.group(1).decode()
+        networking = relative.startswith(NETWORKING_ROOT)
+        if (networking, name) not in cache:
+            schema_path = schema_dirs[networking] / name
+            cache[(networking, name)] = _load_json(schema_path) if schema_path.is_file() else None
+        schema = cache[(networking, name)]
+        if schema is None:
+            findings.append(_finding("check.schema.unknown", relative, f"declares {name}, which is not among the vendored schemas"))
+            continue
+        validated += 1
+        for error in sorted(validators.validator_for(schema)(schema).iter_errors(document), key=lambda e: _dotted(e.absolute_path)):
+            message = error.message if len(error.message) <= 160 else error.message[:157] + "..."
+            findings.append(_finding(f"check.schema.{error.validator}", relative, f"{_dotted(error.absolute_path)}: {message}"))
+    return findings, validated, undeclared
+
+
+def _terraform_fmt(directory: Path) -> tuple[dict, list[dict]]:
+    exe = shutil.which("terraform") or shutil.which("tofu")
+    if exe is None:
+        return _check_result("terraform-fmt", "skipped", "terraform or tofu is not installed"), []
+    env = {**os.environ, "TF_IN_AUTOMATION": "1", "CHECKPOINT_DISABLE": "1"}
+    try:
+        proc = subprocess.run([exe, "fmt", "-check", "-recursive", "-no-color", "."], cwd=directory,
+                              capture_output=True, text=True, timeout=60, env=env, check=False)
+    except subprocess.TimeoutExpired:
+        return _check_result("terraform-fmt", "failed", "timed out after 60s"), [_finding("check.terraform.fmt", ".", "terraform fmt timed out")]
+    if proc.returncode == 0:
+        return _check_result("terraform-fmt", "passed"), []
+    if proc.returncode == 3:
+        files = sorted(line.strip() for line in proc.stdout.splitlines() if line.strip())
+        return (_check_result("terraform-fmt", "failed", f"{len(files)} file(s) not formatted"),
+                [_finding("check.terraform.fmt", f, "not canonically formatted") for f in files])
+    detail = (proc.stderr.strip().splitlines() or ["terraform fmt failed"])[0][:160]
+    return _check_result("terraform-fmt", "failed", detail), [_finding("check.terraform.fmt", ".", detail)]
+
+
+def _run_scanner(argv: list[str], directory: Path, extra_env: dict[str, str], timeout: int = SCAN_TIMEOUT) -> subprocess.CompletedProcess | str:
+    """Run a tool in a directory. Returns the process, or a message if it could not run."""
+    try:
+        return subprocess.run(argv, cwd=directory, capture_output=True, text=True, timeout=timeout,
+                              env={**os.environ, **extra_env}, check=False)
+    except subprocess.TimeoutExpired:
+        return f"timed out after {timeout}s"
+    except OSError as exc:
+        return str(exc)
+
+
+def _scanner_error(name: str, detail: str, path: str = ".") -> tuple[dict, list[dict]]:
+    detail = detail[:160]
+    return _check_result(name, "failed", detail), [_finding(f"check.{name}.error", path, detail)]
+
+
+def _first_error(proc: subprocess.CompletedProcess) -> str:
+    """The first `Error:` line Terraform printed, else its first line of output."""
+    lines = [line.strip() for line in (proc.stderr + "\n" + proc.stdout).splitlines() if line.strip()]
+    return (next((line for line in lines if line.startswith("Error:")), None) or (lines or [f"exit {proc.returncode}"])[0])[:160]
+
+
+def _combine(name: str, results: list[tuple[str, str, str]]) -> dict:
+    """One check result from per-stage (stage, status, detail): any failure fails, any skip is not a pass."""
+    statuses = {status for _, status, _ in results}
+    if "failed" in statuses:
+        status = "failed"
+    elif statuses == {"passed"}:
+        status = "passed"
+    else:
+        status = "skipped" if "skipped" in statuses else "not_applicable"
+    return _check_result(name, status, "; ".join(f"{stage}: {detail}" for stage, _, detail in results))
+
+
+def _trivy_addresses(plan: dict) -> dict[str, str]:
+    """Trivy renames a module resource `<name>_<md5 of its module path>`; map those names back to addresses."""
+    names: dict[str, str] = {}
+
+    def walk(module: dict) -> None:
+        for resource in module.get("resources") or []:
+            address, kind, name = resource["address"], resource["type"], resource["name"]
+            path = address.split(f".{kind}.")[0] if address.startswith("module.") else ""
+            # md5 is trivy's naming scheme here, not a security measure.
+            key = f"{kind}.{name}_{hashlib.md5(path.encode()).hexdigest()}" if path else f"{kind}.{name}"
+            names[key] = f"{path}.{kind}.{name}" if path else f"{kind}.{name}"
+        for child in module.get("child_modules") or []:
+            walk(child)
+
+    walk((plan.get("planned_values") or {}).get("root_module") or {})
+    return names
+
+
+def _scan_trivy(exe: str, directory: Path, stage_path: str, plan: dict) -> tuple[dict, list[dict]]:
+    # `trivy config` exits 0 even with failures, so read the report, not the exit code.
+    proc = _run_scanner([exe, "config", "--format", "json", "--quiet", "--skip-check-update", "."], directory, {})
+    if isinstance(proc, str):
+        return _scanner_error("trivy", proc, stage_path)
+    if proc.returncode != 0:
+        return _scanner_error("trivy", (proc.stderr.strip().splitlines() or [f"exit {proc.returncode}"])[0], stage_path)
+    try:
+        results = json.loads(proc.stdout).get("Results") or []
+    except (json.JSONDecodeError, AttributeError):
+        return _scanner_error("trivy", "output was not a trivy JSON report", stage_path)
+    addresses = _trivy_addresses(plan)
+    findings = []
+    for result in results:
+        for item in result.get("Misconfigurations") or []:
+            if item.get("Status") == "FAIL":
+                resource = (item.get("CauseMetadata") or {}).get("Resource") or ""
+                address = addresses.get(resource, resource)
+                finding = _finding(f"check.trivy.{item.get('ID')}", stage_path,
+                                   f"{item.get('Title')} ({address or 'no resource'}) [{item.get('Severity')}]")
+                findings.append({**finding, "resource": address})
+    return _check_result("trivy", "failed" if findings else "passed"), findings
+
+
+def _scan_checkov(exe: str, directory: Path, stage_path: str, plan: dict) -> tuple[dict, list[dict]]:
+    # Checkov exits 1 when checks fail; any other non-zero code is an error. --skip-download keeps it offline.
+    argv = [exe, "-f", "tfplan.json", "--framework", "terraform_plan", "--output", "json", "--quiet", "--compact", "--skip-download"]
+    proc = _run_scanner(argv, directory, {"BC_SKIP_MAPPING": "TRUE"})
+    if isinstance(proc, str):
+        return _scanner_error("checkov", proc, stage_path)
+    if proc.returncode not in (0, 1):
+        return _scanner_error("checkov", (proc.stderr.strip().splitlines() or [f"exit {proc.returncode}"])[0], stage_path)
+    try:
+        reports = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return _scanner_error("checkov", "output was not a checkov JSON report", stage_path)
+    findings = []
+    for report in reports if isinstance(reports, list) else [reports]:
+        if not isinstance(report, dict):
+            return _scanner_error("checkov", "output was not a checkov JSON report", stage_path)
+        if (report.get("summary") or {}).get("parsing_errors"):
+            findings.append(_finding("check.checkov.parse", stage_path, "checkov could not parse the plan"))
+        for item in (report.get("results") or {}).get("failed_checks") or []:
+            address = str(item.get("resource") or "")
+            finding = _finding(f"check.checkov.{item.get('check_id')}", stage_path, f"{item.get('check_name')} ({address})")
+            findings.append({**finding, "resource": address})
+    return _check_result("checkov", "failed" if findings else "passed"), findings
+
+
+def _load_accepted(cloud: str) -> list[dict]:
+    """The reviewed exceptions for scanner findings on the baseline. A spec can never add one."""
+    path = POLICY_DIR / cloud / ACCEPTED_FINDINGS
+    if not path.is_file():
+        return []
+    try:
+        import yaml
+        entries = yaml.safe_load(path.read_text(encoding="utf-8")) or []
+    except Exception as exc:  # a broken exceptions file must stop the check, not hide findings
+        raise CheckError(f"{path.name} does not parse: {exc}") from exc
+    for entry in entries if isinstance(entries, list) else [None]:
+        if not (
+            isinstance(entry, dict)
+            and entry.get("scanner") in ("trivy", "checkov")
+            and isinstance(entry.get("rule"), str)
+            and entry.get("stage") in STAGES
+            and isinstance(entry.get("resources"), list) and entry["resources"]
+            and all(isinstance(r, str) and r for r in entry["resources"])
+            and isinstance(entry.get("reason"), str) and len(entry["reason"].strip()) >= 20
+        ):
+            raise CheckError(f"{path.name}: every entry needs scanner, rule, stage, resources and a reason")
+        entry["patterns"] = [re.compile(re.escape(r).replace(r"\*", '[^"]*') + r"(\[.*\])?") for r in entry["resources"]]
+    return entries
+
+
+def _accept(findings: list[dict], tool: str, stage: str, accepted: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split findings into (open, accepted). A pattern names a resource: `*` stands for any part of a key, and a
+    pattern without an instance key covers every instance of the resource."""
+    open_findings, matched = [], []
+    for finding in findings:
+        rule = finding["rule"].removeprefix(f"check.{tool}.")
+        entry = next((e for e in accepted if e["scanner"] == tool and e["rule"] == rule and e["stage"] == stage
+                      and any(p.fullmatch(finding.get("resource", "")) for p in e["patterns"])), None)
+        if entry is None:
+            open_findings.append(finding)
+        else:
+            matched.append({"scanner": tool, "rule": rule, "stage": stage, "resource": finding["resource"], "reason": entry["reason"].strip()})
+    return open_findings, matched
+
+
+def _plan_scans(plans: dict[str, dict], cloud: str, unscanned: tuple[str, str] | None) -> tuple[list[dict], list[dict]]:
+    """trivy and checkov on each stage's plan, less the reviewed baseline exceptions. `unscanned` is the
+    (status, detail) to report when there is no plan to scan."""
+    scanners = (("trivy", _scan_trivy), ("checkov", _scan_checkov))
+    if unscanned is not None:
+        return [_check_result(name, *unscanned) for name, _ in scanners], []
+    accepted = _load_accepted(cloud)
+    checks, findings = [], []
+    with tempfile.TemporaryDirectory(prefix="lzctl-scan-") as tmp:
+        for name, scan in scanners:
+            exe = shutil.which(name)
+            if exe is None:
+                checks.append(_check_result(name, "skipped", f"{name} is not installed"))
+                continue
+            results, matched = [], []
+            for stage, plan in plans.items():
+                directory = Path(tmp) / name / stage
+                directory.mkdir(parents=True)
+                (directory / "tfplan.json").write_text(json.dumps(plan), encoding="utf-8")
+                result, found = scan(exe, directory, STAGES[stage][0] + "main.tf", plan)
+                found, accepted_here = _accept(found, name, stage, accepted)
+                matched += accepted_here
+                findings += found
+                # A scanner error comes back as a finding with its own detail.
+                detail = result["detail"] or (f"{len(found)} finding(s)" if found else "no misconfigurations")
+                if accepted_here:
+                    detail += f", {len(accepted_here)} accepted"
+                results.append((stage, "failed" if found else "passed", detail))
+            check = _combine(name, results)
+            if matched:
+                check["accepted"] = matched
+            checks.append(check)
+    return checks, findings
+
+
+def _offline_inputs(on_disk: dict[str, Path], dataset: str) -> dict | None:
+    """Placeholder 0-org-setup outputs for a later stage's offline plan, from the rendered defaults."""
+    try:
+        import yaml
+        defaults = yaml.safe_load(on_disk[f"datasets/{dataset}/defaults.yaml"].read_bytes())
+        return {
+            "billing_account": {"id": str(defaults["global"]["billing_account"])},
+            "organization": {"id": int(defaults["global"]["organization"]["id"])},
+            "prefix": str(defaults["projects"]["defaults"]["prefix"]),
+        }
+    except Exception:  # noqa: BLE001 - any shape problem means the plan cannot get its inputs
+        return None
+
+
+def _unexpected_terraform(report: dict, root: Path, manifest: dict, baseline: dict, stages: list[str]) -> list[dict]:
+    """Terraform runs only on the Terraform files this skill renders, byte for byte: a changed main.tf could
+    point `terraform init` at any module or provider, and a provider is a program that runs here."""
+    render = _template_env(root)
+    findings = []
+    for stage in stages:
+        prefix = STAGES[stage][0]
+        expected = {prefix + path: data for path, data in _stage_root(stage, root, manifest, baseline, render).items()
+                    if TERRAFORM_FILE.search(path) and "/" not in path}
+        present = {path for path in report["files"]
+                   if path.startswith(prefix) and "/" not in path[len(prefix):] and TERRAFORM_FILE.search(path)}
+        for path in sorted(present | set(expected)):
+            if path not in expected:
+                findings.append(_finding("check.terraform.unexpected", path, "not a Terraform file this skill renders; Terraform was not run"))
+            elif path not in present or report["files"][path] != _sha256(expected[path]):
+                findings.append(_finding("check.terraform.unexpected", path, "differs from what this skill renders; Terraform was not run"))
+    return findings
+
+
+def _terraform_checks(report: dict, on_disk: dict[str, Path], why_not: str | None) -> tuple[list[dict], list[dict], dict[str, dict]]:
+    """terraform-validate, terraform-plan and tflint on each stage root. Returns (checks, findings, plans by stage)."""
+    names = ("terraform-validate", "terraform-plan", "tflint")
+    stages = [stage for stage, (prefix, _) in STAGES.items() if prefix + "main.tf" in report["files"]]
+    if not stages:
+        return [_check_result(name, "not_applicable", "no Terraform root module in the rendered output") for name in names], [], {}
+    exe = shutil.which("terraform") or shutil.which("tofu")
+    if why_not is None and exe is None:
+        why_not = "terraform or tofu is not installed"
+    if why_not is not None:
+        return [_check_result(name, "skipped", why_not) for name in names], [], {}
+
+    cloud = report["baseline"]["cloud"]
+    manifest, root = _load_baseline(cloud)
+    baseline = BASELINES[cloud]
+    unexpected = _unexpected_terraform(report, root, manifest, baseline, stages)
+    if unexpected:
+        return [_check_result(name, "skipped", "the Terraform files are not the ones this skill renders") for name in names], unexpected, {}
+
+    cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "lzctl" / "terraform-plugins"
+    env = {"TF_IN_AUTOMATION": "1", "CHECKPOINT_DISABLE": "1", "TF_INPUT": "0",
+           "TF_PLUGIN_CACHE_DIR": os.environ.get("TF_PLUGIN_CACHE_DIR") or str(cache)}
+    Path(env["TF_PLUGIN_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
+    tflint = shutil.which("tflint")
+    tflint_config = POLICY_DIR / cloud / TFLINT_CONFIG
+    nested = [prefix for prefix, _ in STAGES.values() if prefix]
+    results: dict[str, list[tuple[str, str, str]]] = {name: [] for name in names}
+    findings: list[dict] = []
+    plans: dict[str, dict] = {}
+
+    def terraform(args: list[str], work: Path) -> subprocess.CompletedProcess | str:
+        return _run_scanner([exe, *args], work, env, timeout=TERRAFORM_TIMEOUT)
+
+    with tempfile.TemporaryDirectory(prefix="lzctl-check-") as tmp:
+        for stage in stages:
+            prefix = STAGES[stage][0]
+            main = prefix + "main.tf"
+            work = Path(tmp) / stage
+            # Only the files the report lists, so nothing else in the directory reaches Terraform.
+            for relative in report["files"]:
+                inner = relative[len(prefix):]
+                if relative.startswith(prefix) and not any(p != prefix and relative.startswith(p) for p in nested):
+                    (work / inner).parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(on_disk[relative], work / inner)
+
+            # tflint lints the root module itself, before the check adds its offline files.
+            if tflint is None:
+                results["tflint"].append((stage, "skipped", "tflint is not installed"))
+            elif not tflint_config.is_file():
+                results["tflint"].append((stage, "not_applicable", f"no tflint configuration for {cloud}"))
+            else:
+                proc = _run_scanner([tflint, "--config", str(tflint_config), "--format", "json", "--no-color"], work, {})
+                lint = None
+                if not isinstance(proc, str):
+                    try:
+                        lint = json.loads(proc.stdout)
+                    except json.JSONDecodeError:
+                        pass
+                if not isinstance(lint, dict) or lint.get("errors"):
+                    if isinstance(proc, str):
+                        detail = proc
+                    elif isinstance(lint, dict):
+                        detail = str(lint["errors"][0].get("message") or "tflint reported an error")
+                    else:
+                        detail = _first_error(proc)
+                    results["tflint"].append((stage, "failed", detail[:160]))
+                    findings.append(_finding("check.tflint.error", main, detail[:160]))
+                else:
+                    issues = lint.get("issues") or []
+                    for issue in issues:
+                        where = prefix + str((issue.get("range") or {}).get("filename") or "main.tf")
+                        findings.append(_finding(f"check.tflint.{(issue.get('rule') or {}).get('name')}", where, str(issue.get("message"))[:160]))
+                    results["tflint"].append((stage, "failed" if issues else "passed", f"{len(issues)} issue(s)" if issues else "no issues"))
+
+            (work / OFFLINE_PROVIDERS[0]).write_text(OFFLINE_PROVIDERS[1], encoding="utf-8")
+            if (work / "variables-fast.tf").is_file():
+                inputs = _offline_inputs(on_disk, baseline["output_dataset"])
+                if inputs is None:
+                    results["terraform-validate"].append((stage, "skipped", "no 0-org-setup defaults to plan against"))
+                    results["terraform-plan"].append((stage, "skipped", "no 0-org-setup defaults to plan against"))
+                    continue
+                (work / OFFLINE_INPUTS).write_text(json.dumps(inputs), encoding="utf-8")
+
+            init = terraform(["init", "-backend=false", "-input=false", "-no-color"], work)
+            if isinstance(init, str) or init.returncode != 0:
+                # Usually no network: the module and providers are downloaded. Not a finding, and not a pass.
+                detail = f"terraform init failed: {init if isinstance(init, str) else _first_error(init)}"[:160]
+                results["terraform-validate"].append((stage, "skipped", detail))
+                results["terraform-plan"].append((stage, "skipped", detail))
+                continue
+
+            validate = terraform(["validate", "-json", "-no-color"], work)
+            try:
+                verdict = json.loads(validate.stdout) if not isinstance(validate, str) else None
+            except json.JSONDecodeError:
+                verdict = None
+            if not isinstance(verdict, dict):
+                detail = validate if isinstance(validate, str) else _first_error(validate)
+                results["terraform-validate"].append((stage, "failed", detail[:160]))
+                findings.append(_finding("check.terraform.validate", main, detail[:160]))
+            else:
+                errors = [d for d in verdict.get("diagnostics") or [] if d.get("severity") == "error"]
+                for error in errors:
+                    message = f"{error.get('summary')}: {error.get('detail', '')}".strip(": ").replace("\n", " ")
+                    findings.append(_finding("check.terraform.validate", main, message[:160]))
+                results["terraform-validate"].append((stage, "failed" if errors else "passed", f"{len(errors)} error(s)" if errors else "valid"))
+            if results["terraform-validate"][-1][1] != "passed":
+                results["terraform-plan"].append((stage, "skipped", "validate failed"))
+                continue
+
+            plan = terraform(["plan", "-refresh=false", "-lock=false", "-input=false", "-no-color", f"-out={PLAN_FILE}"], work)
+            if isinstance(plan, str) or plan.returncode != 0:
+                detail = plan if isinstance(plan, str) else _first_error(plan)
+                results["terraform-plan"].append((stage, "failed", detail[:160]))
+                findings.append(_finding("check.terraform.plan", main, detail[:160]))
+                continue
+            shown = terraform(["show", "-json", PLAN_FILE], work)
+            try:
+                plans[stage] = json.loads(shown.stdout) if not isinstance(shown, str) else None
+            except json.JSONDecodeError:
+                plans[stage] = None
+            if not isinstance(plans[stage], dict):
+                del plans[stage]
+                results["terraform-plan"].append((stage, "failed", "terraform show did not return a plan"))
+                findings.append(_finding("check.terraform.plan", main, "terraform show did not return a plan"))
+                continue
+            creates = sum(1 for change in plans[stage].get("resource_changes") or [] if "create" in change["change"]["actions"])
+            results["terraform-plan"].append((stage, "passed", f"{creates} resources planned offline"))
+
+    return [_combine(name, results[name]) for name in names], findings, plans
+
+
+def _policy_check(directory: Path, report: dict, on_disk: dict[str, Path], unparsable: bool) -> tuple[dict, list[dict]]:
+    """Run the cloud's conftest policy pack over the rendered YAML datasets."""
+    cloud = report["baseline"]["cloud"]
+    pack = POLICY_DIR / cloud
+    if not pack.is_dir():
+        return _check_result("conftest", "not_applicable", f"no policy pack for {cloud}"), []
+    targets = [t for t in POLICY_TARGETS if any(p.startswith(t + "/") and p.endswith((".yaml", ".yml")) for p in on_disk)]
+    if not targets:
+        return _check_result("conftest", "not_applicable", "no YAML datasets in the rendered output"), []
+    if unparsable:
+        return _check_result("conftest", "skipped", "some YAML files do not parse; fix those findings first"), []
+    exe = shutil.which("conftest")
+    if exe is None:
+        return _check_result("conftest", "skipped", "conftest is not installed"), []
+    argv = [exe, "test", "--policy", str(pack), "--combine", "--parser", "yaml", "--output", "json", "--no-color", *targets]
+    proc = _run_scanner(argv, directory, {})
+    if isinstance(proc, str):
+        return _scanner_error("conftest", proc)
+    # conftest exits 1 when a rule denies; anything else non-zero is an error.
+    if proc.returncode not in (0, 1):
+        return _scanner_error("conftest", (proc.stderr.strip().splitlines() or [f"exit {proc.returncode}"])[0])
+    try:
+        results = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return _scanner_error("conftest", "output was not a conftest JSON report")
+    findings = []
+    for result in results if isinstance(results, list) else []:
+        for failure in result.get("failures") or []:
+            meta = failure.get("metadata") or {}
+            findings.append(_finding(f"check.conftest.{meta.get('rule', 'policy')}", str(meta.get("path", ".")), str(failure.get("msg", ""))))
+    rules = sum(r.get("successes", 0) + len(r.get("failures") or []) for r in results if isinstance(r, dict))
+    if findings:
+        return _check_result("conftest", "failed", f"{len(findings)} finding(s)"), findings
+    return _check_result("conftest", "passed", f"{rules} policy rules passed"), []
+
+
+def check_output(directory: Path, offline: bool = False) -> tuple[list[dict], list[dict]]:
+    """Verify a rendered directory. Returns (checks, findings); findings is empty when clean.
+    `offline` skips the checks that need Terraform to download the stage module and providers."""
+    report = _load_report(directory)
+    on_disk, links = _walk_files(directory)
+
+    integrity = _integrity_findings(report, on_disk, links)
+    checks = [_check_result("integrity", "failed" if integrity else "passed",
+                            f"{len(integrity)} finding(s)" if integrity else f"{len(report['files'])} files match the render report")]
+
+    schema, validated, undeclared = _schema_check(report, on_disk)
+    checks.append(_check_result("upstream-schemas", "failed" if schema else "passed",
+                                f"{validated} YAML files validated, {undeclared} declare no schema"))
+
+    fmt_check, fmt = _terraform_fmt(directory)
+    checks.append(fmt_check)
+    # Inline suppressions would let rendered HCL opt out of the scans.
+    suppressions = [_finding("check.hcl.suppression", relative, "inline scanner suppressions are not allowed in rendered output")
+                    for relative, path in sorted(on_disk.items()) if relative.endswith(".tf") and SUPPRESSION.search(path.read_bytes())]
+    unparsable = any(f["rule"] == "check.yaml.parse" for f in schema)
+    policy_check, policy = _policy_check(directory, report, on_disk, unparsable)
+    checks.append(policy_check)
+
+    why_not = None
+    if offline:
+        why_not = "not run with --offline"
+    elif integrity or suppressions:
+        why_not = "the files do not match the render report; fix the integrity findings first"
+    elif unparsable:
+        why_not = "some YAML files do not parse; fix those findings first"
+    terraform_checks, terraform, plans = _terraform_checks(report, on_disk, why_not)
+    checks += terraform_checks
+    plan_status = next(c for c in terraform_checks if c["name"] == "terraform-plan")
+    unscanned = None
+    if not plans:
+        unscanned = (("not_applicable", plan_status["detail"]) if plan_status["status"] == "not_applicable"
+                     else ("skipped", "there is no plan to scan; see terraform-plan"))
+    scans, scan_findings = _plan_scans(plans, report["baseline"]["cloud"], unscanned)
+    checks += scans
+
+    findings = sorted(integrity + schema + fmt + suppressions + policy + terraform + scan_findings,
+                      key=lambda f: (f["path"], f["rule"], f["message"]))
+    return checks, findings
+
+
+def validation_report(report: dict, checks: list[dict], findings: list[dict]) -> str:
+    """The check result as markdown, to travel with the pull request. Deterministic: no timestamps."""
+    did_not_run = [c for c in checks if c["status"] in ("not_applicable", "skipped")]
+    if findings:
+        verdict = f"**Failed:** {len(findings)} finding(s)."
+    elif did_not_run:
+        verdict = (f"**Passed, but not fully validated:** {len(did_not_run)} check(s) did not run "
+                   "(see below), so the output is not fully validated.")
+    else:
+        verdict = "**Passed:** every check ran and found nothing."
+    baseline = report["baseline"]
+    lines = [
+        "# Validation report",
+        "",
+        f"Written by `lzctl check` for output hash `{report['output_hash']}`, rendered from "
+        f"{_md(baseline.get('tag', 'an unknown baseline'))}. Run `lzctl check` on the directory to reproduce it.",
+        "",
+        verdict,
+        "",
+        "## Checks",
+        "",
+        "| Check | Status | Detail |",
+        "| --- | --- | --- |",
+    ]
+    lines += [f"| {_md(c['name'])} | {_md(c['status'])} | {_md(c['detail'])} |" for c in checks]
+    lines += ["", "## Findings", ""]
+    if findings:
+        lines += ["| Rule | File | Message |", "| --- | --- | --- |"]
+        lines += [f"| `{_md_code(f['rule'])}` | `{_md_code(f['path'])}` | {_md(f['message'])} |" for f in findings]
+    else:
+        lines.append("None.")
+    accepted = [a for c in checks for a in c.get("accepted") or []]
+    lines += ["", "## Accepted baseline findings", ""]
+    if accepted:
+        lines += ["These scanner findings are on resources the FAST baseline defines, and are reviewed and accepted in the "
+                  "skill's exceptions file. A spec cannot add to it.", "",
+                  "| Scanner | Rule | Stage | Findings | Reason |", "| --- | --- | --- | --- | --- |"]
+        grouped: dict[tuple[str, str, str, str], int] = {}
+        for a in accepted:
+            key = (a["scanner"], a["rule"], a["stage"], a["reason"])
+            grouped[key] = grouped.get(key, 0) + 1
+        lines += [f"| {_md(s)} | `{_md_code(r)}` | {_md(st)} | {n} | {_md(reason)} |" for (s, r, st, reason), n in sorted(grouped.items())]
+    else:
+        lines.append("None.")
+    lines += ["", "## What has not been validated", ""]
+    if did_not_run:
+        lines += ["These checks did not run. A check that did not run is not a pass.", ""]
+        lines += [f"- {_md(c['name'])} ({_md(c['status'])}): {_md(c['detail'])}" for c in did_not_run]
+    else:
+        lines.append("Every check ran.")
+    deferred = report.get("not_rendered_yet") or {}
+    if deferred:
+        lines += ["", "Spec fields that are not in the configuration yet (see `README.md`):", ""]
+        lines += [f"- `{_md_code(field)}`: {_md(needs)}" for field, needs in sorted(deferred.items())]
+    return "\n".join(lines) + "\n"
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    directory = Path(args.dir)
+    if not directory.is_dir():
+        return _fail(f"{directory} is not a directory")
+    try:
+        checks, findings = check_output(directory, offline=args.offline)
+    except CheckError as exc:
+        return _fail(str(exc))
+    if args.write_report:
+        (directory / VALIDATION_REPORT).write_text(validation_report(_load_report(directory), checks, findings), encoding="utf-8")
+
+    if args.format == "json":
+        print(json.dumps({"ok": not findings, "checks": checks, "findings": findings}, indent=2, sort_keys=True))
+    else:
+        for c in checks:
+            print(f"{c['status']:15} {c['name']}" + (f": {c['detail']}" if c["detail"] else ""))
+        for f in findings:
+            print(f"{f['path']}: {f['message']} [{f['rule']}]")
+    return EXIT_FINDINGS if findings else EXIT_OK
+
+
+# --- explain ----------------------------------------------------------------
+
+
+def _cause(finding: dict, report: dict | None) -> dict:
+    """Where a finding comes from: the spec field(s) to change, or why the spec is not the cause."""
+    rule, path = finding["rule"], finding["path"]
+    if not rule.startswith("check."):
+        # A `spec validate` finding: its path already is the spec field.
+        return {"kind": "spec", "spec_fields": [path], "advice": "Change this field in the spec."}
+    if rule.startswith("check.integrity."):
+        return {"kind": "integrity", "spec_fields": [],
+                "advice": "Rendered files are never edited by hand. Re-run `lzctl render` into an empty directory."}
+    if rule == "check.baseline.mismatch":
+        return {"kind": "baseline", "spec_fields": ["target.baseline_version"],
+                "advice": "The output was rendered with a different baseline than this skill vendors. Re-render with this skill version."}
+    if rule == "check.hcl.suppression":
+        return {"kind": "template", "spec_fields": [],
+                "advice": "Rendered HCL must not carry scanner suppressions. This is a template bug or a hand edit: re-render, and report the template if it persists."}
+    if rule == "check.terraform.unexpected":
+        return {"kind": "integrity", "spec_fields": [],
+                "advice": "Terraform runs only on the Terraform files this skill renders. Re-run `lzctl render` into an empty directory."}
+    if rule.startswith(("check.terraform.validate", "check.terraform.plan", "check.tflint.")):
+        return {"kind": "terraform", "spec_fields": [],
+                "advice": "Terraform or tflint rejected the rendered stage. If the message names a value from the spec, change that field; "
+                          "otherwise it is a template or baseline bug: report it."}
+    if rule.startswith(("check.trivy.", "check.checkov.")):
+        return {"kind": "scan", "spec_fields": [],
+                "advice": f"A planned resource{' (' + finding['resource'] + ')' if finding.get('resource') else ''} fails this scanner rule, "
+                          "and no reviewed exception covers it. The spec does not set it directly: report it, so the templates are fixed or "
+                          "the finding is reviewed for the exceptions file."}
+    if report is None:
+        return {"kind": "unknown", "spec_fields": [], "advice": "Pass the rendered directory so the finding can be traced to the spec."}
+    sources = report.get("sources")
+    fields = sources.get(path) if isinstance(sources, dict) else None
+    if isinstance(fields, list) and fields and all(isinstance(f, str) for f in fields):
+        return {"kind": "spec", "spec_fields": sorted(fields),
+                "advice": "Change one of these spec fields. If every value is valid, the template is wrong: report it as a bug."}
+    if path in report["files"]:
+        return {"kind": "vendored", "spec_fields": [],
+                "advice": "Unmodified upstream baseline file; no spec field drives it. The baseline or its vendored copy is at fault: do not edit it."}
+    return {"kind": "unknown", "spec_fields": [], "advice": "This path is not in the render report."}
+
+
+def explain_findings(findings: list[dict], report: dict | None) -> list[dict]:
+    # A file changed after rendering explains every other finding on it; blaming the spec would mislead.
+    altered = {f["path"] for f in findings if f["rule"].startswith("check.integrity.") and f["rule"] != "check.integrity.output_hash"}
+    explained = []
+    for finding in findings:
+        if finding["rule"].startswith("check.") and not finding["rule"].startswith("check.integrity.") and finding["path"] in altered:
+            cause = {"kind": "integrity", "spec_fields": [],
+                     "advice": "This file was changed after rendering, which explains this finding. Re-run `lzctl render` into an empty directory first."}
+        else:
+            cause = _cause(finding, report)
+        explained.append({**finding, "cause": cause})
+    return explained
+
+
+def _read_findings(source: str) -> list[dict]:
+    try:
+        raw = sys.stdin.read() if source == "-" else Path(source).read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except FileNotFoundError as exc:
+        raise CheckError(f"{source} not found") from exc
+    except json.JSONDecodeError as exc:
+        raise CheckError(f"{source} is not valid JSON: {exc}") from exc
+    findings = data.get("findings") if isinstance(data, dict) else data
+    if not isinstance(findings, list) or not all(
+        isinstance(f, dict) and all(isinstance(f.get(k), str) for k in ("rule", "path", "message")) for f in findings
+    ):
+        raise CheckError(f"{source} must hold findings (rule, path, message) or a `check` or `spec validate` result")
+    return findings
+
+
+def cmd_explain(args: argparse.Namespace) -> int:
+    directory = Path(args.dir) if args.dir else None
+    try:
+        report = None
+        if directory is not None:
+            if not directory.is_dir():
+                raise CheckError(f"{directory} is not a directory")
+            report = _load_report(directory)
+        if args.findings:
+            findings = _read_findings(args.findings)
+        elif directory is not None:
+            findings = check_output(directory, offline=args.offline)[1]
+        else:
+            raise CheckError("give a rendered directory to check, or --findings <file|->")
+    except CheckError as exc:
+        return _fail(str(exc))
+    print(json.dumps({"explained": explain_findings(findings, report)}, indent=2, sort_keys=True))
+    return EXIT_OK
+
+
+# --- other commands ---------------------------------------------------------
+
+
+def cmd_spec_validate(args: argparse.Namespace) -> int:
+    path = Path(args.spec)
+    try:
+        spec = _load_json(path)
+    except FileNotFoundError:
+        return _fail(f"{path} not found")
+    except json.JSONDecodeError as exc:
+        return _fail(f"{path} is not valid JSON: {exc}")
+
+    try:
+        findings = validate_spec(spec)
+    except RuntimeError as exc:
+        return _fail(str(exc))
+
+    if args.format == "json":
+        print(json.dumps({"valid": not findings, "findings": findings}, indent=2, sort_keys=True))
+    elif findings:
+        for f in findings:
+            print(f"{f['path']}: {f['message']} [{f['rule']}]")
+    else:
+        print("spec is valid")
+    return EXIT_FINDINGS if findings else EXIT_OK
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    checks = []
+    py_ok = sys.version_info >= (3, 11)
+    checks.append({"name": "python>=3.11", "ok": py_ok, "required": True, "detail": sys.version.split()[0]})
+    for module, pip_name in (("jsonschema", "jsonschema"), ("jinja2", "jinja2"), ("yaml", "PyYAML")):
+        try:
+            __import__(module)
+            checks.append({"name": module, "ok": True, "required": True, "detail": metadata.version(pip_name)})
+        except ImportError:
+            checks.append({"name": module, "ok": False, "required": True, "detail": f"pip install {pip_name}"})
+    for tool, purpose in TOOLS.items():
+        found = shutil.which(tool)
+        checks.append({"name": tool, "ok": bool(found), "required": False, "detail": found or f"missing ({purpose})"})
+
+    ok = all(c["ok"] for c in checks if c["required"])
+    if args.format == "json":
+        print(json.dumps({"ok": ok, "checks": checks}, indent=2))
+    else:
+        for c in checks:
+            mark = "ok " if c["ok"] else ("MISSING" if c["required"] else "optional-missing")
+            print(f"{mark:16} {c['name']}: {c['detail']}")
+    return EXIT_OK if ok else EXIT_FINDINGS
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="lzctl", description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    spec = sub.add_parser("spec", help="spec commands").add_subparsers(dest="spec_command", required=True)
+    validate = spec.add_parser("validate", help="validate a spec file")
+    validate.add_argument("spec", help="path to the spec JSON file")
+    validate.add_argument("--format", choices=["json", "text"], default="json")
+    validate.set_defaults(func=cmd_spec_validate)
+
+    render = sub.add_parser("render", help="render a spec into configuration data")
+    render.add_argument("spec", help="path to the spec JSON file")
+    render.add_argument("--out", required=True, help="output directory (must be empty or absent)")
+    render.set_defaults(func=cmd_render)
+
+    check = sub.add_parser("check", help="verify a rendered directory")
+    check.add_argument("dir", help="directory written by `lzctl render`")
+    check.add_argument("--format", choices=["json", "text"], default="json")
+    check.add_argument("--write-report", action="store_true", help=f"write {VALIDATION_REPORT} into the directory")
+    check.add_argument("--offline", action="store_true", help="skip the Terraform checks, which download the stage module and providers")
+    check.set_defaults(func=cmd_check)
+
+    explain = sub.add_parser("explain", help="map findings back to spec fields")
+    explain.add_argument("dir", nargs="?", help="rendered directory; without --findings it is checked first")
+    explain.add_argument("--findings", help="JSON from `check` or `spec validate` ('-' for stdin)")
+    explain.add_argument("--offline", action="store_true", help="when checking the directory, skip the Terraform checks")
+    explain.set_defaults(func=cmd_explain)
+
+    doctor = sub.add_parser("doctor", help="check runtime dependencies")
+    doctor.add_argument("--format", choices=["json", "text"], default="json")
+    doctor.set_defaults(func=cmd_doctor)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
